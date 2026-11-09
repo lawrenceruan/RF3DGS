@@ -12,9 +12,14 @@
 import os
 import torch
 from random import randint
+from custom_utils.training_checkpoint import save_training_checkpoint, restore_training_checkpoint
 from utils.loss_utils import l1_loss, l2_loss, ssim, ssim_max
 from utils.loss_utils import l1_loss_min, l2_loss_min, l1_loss_sample, l2_loss_sample, l1_loss_min_sample, ssim_sample, l1_loss_min_triple, l2_loss_min_triple, normalized_enhanced_loss
 from gaussian_renderer import render, network_gui
+from pathlib import Path
+from PIL import Image
+from torch.nn import functional as F
+from utils.general_utils import PILtoTorch
 import sys
 from scene.gaussian_model import GaussianModel
 from scene.scene_2nd_stage import Scene
@@ -33,15 +38,17 @@ except ImportError:
 SPARSE_ADAM_AVAILABLE = False
 
 ## WEN Qiang
-from custom_utils.vgg_loss import VGGLoss
+from custom_utils.frequency_prior import FrequencyTargets, lowpass, detail_loss
+from custom_utils.correspondence_prior import CorrespondenceTargets
+from custom_utils.sampled_ssim import ssim_sample_patches
+from custom_utils.run_metadata import record_training_args
 from custom_utils.ex_loss import ExclusionLoss, ExclusionLoss_sample
 from custom_utils.tv_loss import total_variation_loss as criterion_tv
 from custom_utils.bilateral_loss import BilateralLoss
-from custom_utils.his_match import HistogramMatchingLoss
+from custom_utils.his_match import DifferentiableHistogramMatchingLoss as HistogramMatchingLoss
 
 criterion_ex = ExclusionLoss()
 criterion_ex_sample = ExclusionLoss_sample()
-criterion_vgg = VGGLoss().cuda()
 criterion_huber = torch.nn.HuberLoss(reduction='mean', delta=1.0)
 criterion_bilateral_depth = BilateralLoss(gamma=2)
 criterion_bilateral_beta = BilateralLoss(gamma=2)
@@ -64,7 +71,25 @@ def exc_weight(iteration):
     else:
         return 0.01
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def pooled_rgb(image):
+    return F.avg_pool2d(image, 8, stride=8, ceil_mode=True, count_include_pad=False)
+
+
+@torch.no_grad()
+def prior_color_targets(cameras, prior_root):
+    targets = {}
+    for cam in cameras:
+        visible = cam.original_image_pseudo_warped.cuda()
+        with Image.open(Path(prior_root) / 'pseudo_GT' / Path(cam.image_name).name) as im:
+            legacy = PILtoTorch(im.convert("RGB"), (cam.image_width, cam.image_height)).to(visible)
+        agree = (visible - legacy).abs().amax(0, keepdim=True) <= 0.05
+        trusted = pooled_rgb(agree.float()) >= 0.75
+        target = pooled_rgb((visible + legacy) * 0.5)
+        targets[cam.image_name] = (target, trusted)
+    return targets
+
+
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, prior_color_weight=0.0, histogram_weight=0.0, full_ssim=False, atr_until=3000, depth_smooth_weight=10.0, frequency_prior=False, frequency_cache="", frequency_weight=0.1, correspondence_prior=False, correspondence_cache="", correspondence_weight=0.1, sampled_ssim_patches=False):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -77,6 +102,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     
     scene = Scene(dataset, gaussians_T, gaussians_R, gaussians_Beta_R)
         
+    targets = {}
+    if prior_color_weight:
+        targets = prior_color_targets(scene.getTrainCameras(), dataset.pseudo_source_path)
+
+    correspondence_targets = CorrespondenceTargets(scene.getTrainCameras(), correspondence_cache) if correspondence_prior else None
+    frequency_targets = FrequencyTargets(scene.getTrainCameras(), frequency_cache) if frequency_prior else None
+
     gaussians_T.training_setup(opt)
     gaussians_R.training_setup(opt)
     gaussians_Beta_R.training_setup(opt)
@@ -94,6 +126,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
+
+    if checkpoint:
+        first_iter, viewpoint_stack = restore_training_checkpoint(
+            checkpoint, (gaussians_T, gaussians_R, gaussians_Beta_R), opt,
+            scene.getTrainCameras())
+        if first_iter >= opt.iterations:
+            raise ValueError("Checkpoint has already reached the requested iteration count")
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -141,7 +180,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         fake_full = image_T + image_R * beta_map_one_channel_R
 
         Ll1 = l1_loss(fake_full, gt_image)
-        ssim_value = ssim_sample(fake_full, gt_image)
+        if full_ssim:
+            # Preserve the CPU draws that the sampled loss would have consumed.
+            torch.randint(0, gt_image.shape[-2], (100,))
+            torch.randint(0, gt_image.shape[-1], (100,))
+            ssim_value = ssim(fake_full, gt_image)
+        elif sampled_ssim_patches:
+            ssim_value = ssim_sample_patches(fake_full, gt_image)
+        else:
+            ssim_value = ssim_sample(fake_full, gt_image)
         
         loss_full = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
 
@@ -165,22 +212,42 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             Ll1depth = 0
 
-        if iteration < 3000:
-            loss_T = l2_loss_min(image_T, gt_image, pseudo_gt_image_warped) * 1 + \
-                     criterion_hismatch(image_T.unsqueeze(0), gt_image.unsqueeze(0)) * 1
-        else:
-            loss_T = criterion_hismatch(image_T.unsqueeze(0), gt_image.unsqueeze(0)) * 1
+        loss_T = image_T.new_zeros(())
+        prior_for_exclusion = pseudo_gt_image_warped
+        if frequency_prior:
+            low_gt, low_prior, target_hp, confidence = frequency_targets.get(viewpoint_cam.image_name, image_T.device)
+            low_T = lowpass(image_T)
+            prior_for_exclusion = low_prior
+            if iteration < atr_until:
+                loss_T = l2_loss_min(low_T, low_gt, low_prior)
+            ramp = min(1.0, max(0.0, (iteration-1000)/2000))
+            loss_T = loss_T + frequency_weight*ramp*detail_loss(image_T-low_T, target_hp, confidence)
+        elif iteration < atr_until:
+            loss_T = l2_loss_min(image_T, gt_image, pseudo_gt_image_warped)
+        if correspondence_prior:
+            target_hp, confidence = correspondence_targets.get(viewpoint_cam.image_name, image_T.device)
+            ramp = min(1.0, max(0.0, (iteration-1000)/2000))
+            loss_T = loss_T + correspondence_weight*ramp*detail_loss(image_T-lowpass(image_T), target_hp, confidence)
+        if histogram_weight:
+            loss_T = loss_T + histogram_weight * criterion_hismatch(
+                image_T.unsqueeze(0), gt_image.unsqueeze(0))
+
+        if prior_color_weight and iteration >= 3000:
+            target, trusted = targets[viewpoint_cam.image_name]
+            # Penalize broad color drift, with a 3% dead band for exposure differences.
+            drift = ((pooled_rgb(image_T) - target).abs() - 0.03).clamp_min(0)
+            loss_T += prior_color_weight * (drift * trusted).sum() / (3 * trusted.sum().clamp_min(1))
 
         loss_T_depth = criterion_bilateral_depth(render_pkg_T['depth'][0].unsqueeze(0),
-                                                 render_pkg_T['depth'][0].unsqueeze(0).unsqueeze(-1)) * 10
+                                                 render_pkg_T['depth'][0].unsqueeze(0).unsqueeze(-1)) * depth_smooth_weight
 
         loss_R_depth = criterion_bilateral_depth(render_pkg_R['depth'][0].unsqueeze(0),
-                                                 render_pkg_R['depth'][0].unsqueeze(0).unsqueeze(-1)) * 10
+                                                 render_pkg_R['depth'][0].unsqueeze(0).unsqueeze(-1)) * depth_smooth_weight
 
         loss_beta = criterion_tv(beta_map_one_channel_R.unsqueeze(0))
                     
         loss_exc = (criterion_ex(image_T.unsqueeze(0), image_R.unsqueeze(0)) + 
-                    criterion_ex(pseudo_gt_image_warped.unsqueeze(0), image_R.unsqueeze(0))) * exc_weight(iteration)
+                    criterion_ex(prior_for_exclusion.unsqueeze(0), image_R.unsqueeze(0))) * exc_weight(iteration)
 
         loss += loss_T + loss_T_depth + loss_R_depth + loss_exc + loss_beta
 
@@ -245,9 +312,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians_T.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
-                torch.save((gaussians_R.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
-                torch.save((gaussians_Beta_R.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                save_training_checkpoint(
+                    Path(scene.model_path) / f"chkpnt{iteration}.pth",
+                    (gaussians_T, gaussians_R, gaussians_Beta_R), iteration,
+                    scene.getTrainCameras(), viewpoint_stack,
+                    optimizer_step_pending=iteration == opt.iterations)
 
 def prepare_output_and_logger(args):    
     args.model_path = os.path.join("./output/", args.scene_name)
@@ -275,17 +344,43 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--prior_color_weight", type=float, default=0.0)
+    parser.add_argument("--histogram_weight", type=float, default=0.0)
+    parser.add_argument("--full_ssim", action="store_true")
+    parser.add_argument("--atr_until", type=int, default=3000)
+    parser.add_argument("--depth_smooth_weight", type=float, default=10.0)
+    parser.add_argument("--frequency_prior", action="store_true", help="Optional confidence-gated frequency-separated prior")
+    parser.add_argument("--frequency_cache", default="", help="Fitting-view confidence directory from prepare_frequency.py")
+    parser.add_argument("--frequency_weight", type=float, default=0.1)
+    parser.add_argument("--correspondence_prior", action="store_true", help="Experimental validated correspondence detail; legacy losses retained")
+    parser.add_argument("--correspondence_cache", default="")
+    parser.add_argument("--correspondence_weight", type=float, default=.1)
+    parser.add_argument("--sampled_ssim_patches", action="store_true", help="Optional computation of sampled SSIM only at its sampled neighborhoods")
     args = parser.parse_args(sys.argv[1:])
+    if args.full_ssim and args.sampled_ssim_patches:
+        parser.error("Choose full-image SSIM or sampled SSIM patches, not both")
+    if args.frequency_weight < 0 or (args.frequency_prior and not args.frequency_cache):
+        parser.error("frequency_prior requires a cache and nonnegative weight")
+    if args.correspondence_weight < 0 or (args.correspondence_prior and not args.correspondence_cache):
+        parser.error("correspondence_prior requires a cache and nonnegative weight")
+    if args.correspondence_prior and args.frequency_prior:
+        parser.error("Test correspondence and frequency modes separately")
+    if args.histogram_weight < 0 or args.atr_until < 0 or args.depth_smooth_weight < 0:
+        parser.error("Loss weights and iteration limits must be nonnegative")
+    if args.prior_color_weight < 0 or (args.prior_color_weight and args.pseudo_warp_folder not in ("pseudo_GT_visible", "pseudo_GT_consensus")):
+        parser.error("prior_color_weight requires a nonnegative weight and a depth-checked prior when enabled")
     args.save_iterations.append(args.iterations)
     
     print("Optimizing " + args.model_path)
+
+    record_training_args(args, __file__, sys.argv[1:])
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
     # Start GUI server, configure and run training
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.prior_color_weight, args.histogram_weight, args.full_ssim, args.atr_until, args.depth_smooth_weight, args.frequency_prior, args.frequency_cache, args.frequency_weight, args.correspondence_prior, args.correspondence_cache, args.correspondence_weight, args.sampled_ssim_patches)
 
     # All done
     print("\nTraining complete.")

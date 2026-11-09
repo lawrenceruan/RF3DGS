@@ -24,6 +24,13 @@ def sample_pixels(image, num_samples):
     
     return sampled_pixels
 
+def fourth_root(energy):
+    # Preserve the original positive-energy loss and define a zero gradient
+    # when a channel pair has no overlapping edges.
+    zero = energy == 0
+    return energy.masked_fill(zero, 1).pow(0.25).masked_fill(zero, 0)
+
+
 class ExclusionLoss(nn.Module):
 
     def __init__(self, level=3):
@@ -41,7 +48,7 @@ class ExclusionLoss(nn.Module):
         gradx_loss = []
         grady_loss = []
 
-        for l in range(self.level):
+        for l in range(1):
             gradx1, grady1 = self.compute_gradient(img1)
             gradx2, grady2 = self.compute_gradient(img2)
             # alphax = 2.0 * torch.mean(torch.abs(gradx1)) / torch.mean(torch.abs(gradx2))
@@ -67,12 +74,13 @@ class ExclusionLoss(nn.Module):
         v = []
         for i in range(3):
             for j in range(3):
-                v.append(torch.mean(((grad1_s[:, j, :, :] ** 2) * (grad2_s[:, i, :, :] ** 2))) ** 0.25)
+                energy = torch.mean((grad1_s[:, j] ** 2) * (grad2_s[:, i] ** 2))
+                v.append(fourth_root(energy))
         return v
 
     def forward(self, img1, img2):        
         gradx_loss, grady_loss = self.get_gradients(img1, img2)
-        loss_gradxy = sum(gradx_loss) / (self.level * 9) + sum(grady_loss) / (self.level * 9)
+        loss_gradxy = sum(gradx_loss) / 9 + sum(grady_loss) / 9
         return loss_gradxy / 2.0
 
     def compute_gradient(self, img):
@@ -125,7 +133,8 @@ class ExclusionLoss_sample(nn.Module):
         v = []
         for i in range(3):
             for j in range(3):
-                v.append(torch.mean(((grad1_s[:, j, :, :] ** 2) * (grad2_s[:, i, :, :] ** 2))) ** 0.25)
+                energy = torch.mean((grad1_s[:, j] ** 2) * (grad2_s[:, i] ** 2))
+                v.append(fourth_root(energy))
         return v
 
     def forward(self, img1, img2):        

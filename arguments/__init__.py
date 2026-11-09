@@ -49,6 +49,7 @@ class ModelParams(ParamGroup):
         self.sh_degree = 3
         self._source_path = ""
         self._pseudo_source_path = ""
+        self.pseudo_warp_folder = "pseudo_GT"
         self._model_path = ""
         self._images = "images"
         self._depths = ""

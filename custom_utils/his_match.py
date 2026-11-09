@@ -40,3 +40,25 @@ class HistogramMatchingLoss(nn.Module):
         loss = torch.mean((input_cdf - target_cdf) ** 2)
 
         return loss
+
+
+class DifferentiableHistogramMatchingLoss(nn.Module):
+    """Squared CDF distance with differentiable linear bin assignment."""
+
+    def __init__(self, bins=256):
+        super().__init__()
+        if bins < 2:
+            raise ValueError("Histogram matching needs at least two bins")
+        self.bins = bins
+
+    def cdf(self, image):
+        position = image.clamp(0, 1).reshape(-1) * (self.bins - 1)
+        lower = position.floor().long()
+        fraction = position - lower
+        histogram = position.new_zeros(self.bins)
+        histogram.scatter_add_(0, lower, 1 - fraction)
+        histogram.scatter_add_(0, (lower + 1).clamp_max(self.bins - 1), fraction)
+        return histogram.cumsum(0) / position.numel()
+
+    def forward(self, input, target):
+        return (self.cdf(input) - self.cdf(target)).square().mean()

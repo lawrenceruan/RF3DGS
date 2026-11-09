@@ -27,6 +27,8 @@ import math
 from nerf.run_nerf_helpers import *
 import cv2
 
+from pathlib import Path
+from custom_utils.visible_prior import camera_rays, visible_sample, robust_prior, consensus_prior
 from functools import reduce
 
 NORM_MAX = -math.inf
@@ -177,7 +179,7 @@ def project_points_image_show(
     return points_uv
 
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, threshold, file_name):
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, threshold, file_name, pixel_center_offset=0.0):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration))
 
     gt_list = []
@@ -264,8 +266,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
                 source_image = gt_list[img_idx].unsqueeze(0)
 
-                points_uv_x = points_uv[..., 0] / image_width * 2 - 1
-                points_uv_y = points_uv[..., 1] / image_height * 2 - 1
+                points_uv_x = (points_uv[..., 0] + pixel_center_offset) / image_width * 2 - 1
+                points_uv_y = (points_uv[..., 1] + pixel_center_offset) / image_height * 2 - 1
                 points_uv_xy = torch.stack(
                     (points_uv_x, points_uv_y), dim=-1
                 ).unsqueeze(0)
@@ -322,6 +324,53 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         # cv2.imwrite(os.path.join(pseudo_gt_save_dir, view.image_name.replace('frame', 'mask')), invalid_mask_cv2)
 
 
+def render_visible_set(model_path, name, iteration, views, threshold, folder, tolerance, device, consensus=False, border_margin=0):
+    if not views:
+        return
+    root = Path(model_path) / name / f"ours_{iteration}"
+    poses, depths, focals = [], [], []
+    for view in views:
+        w2c = torch.eye(4, device=device)
+        w2c[:3, :3] = torch.as_tensor(view.R.T, device=device)
+        w2c[:3, 3] = torch.as_tensor(view.T, device=device)
+        poses.append(w2c)
+        depth = torch.load(root / "Depth_pth" / (view.image_name.split(".")[0] + ".pth"),
+                           map_location="cpu")
+        if depth.shape != (1, view.image_height, view.image_width):
+            raise ValueError(f"Depth/image size mismatch for {view.image_name}")
+        depths.append(depth)
+        focals.append((fov2focal(view.FoVx, view.image_width),
+                       fov2focal(view.FoVy, view.image_height)))
+    c2w = [torch.linalg.inv(pose) for pose in poses]
+    out = root / folder
+    out.mkdir(parents=True, exist_ok=True)
+    for i, view in enumerate(tqdm(views, desc="Visible priors")):
+        target = view.original_image[:3].to(device)
+        depth = depths[i].to(device)
+        rays = camera_rays(*target.shape[-2:], *focals[i], device)
+        points = rays * torch.where(torch.isfinite(depth) & (depth > 0), depth, float("nan"))
+
+        def samples(target_points):
+            for j, src in enumerate(views):
+                if j != i and torch.linalg.norm(c2w[i] - c2w[j]) < threshold:
+                    yield visible_sample(target_points, poses[j] @ c2w[i], src.original_image[:3].to(device),
+                                         depths[j].to(device), *focals[j], tolerance, border_margin)
+
+        if consensus:
+            prior = torch.empty_like(target)
+            used = torch.empty_like(target[0], dtype=torch.bool)
+            for y in range(0, target.shape[1], 96):
+                rows = slice(y, y + 96)
+                prior[:, rows], used[rows] = consensus_prior(target[:, rows], samples(points[:, rows]))
+        else:
+            prior, used = robust_prior(target, samples(points))
+        path = out / Path(view.image_name).name
+        bgr = (prior[[2, 1, 0]].permute(1, 2, 0).clamp(0, 1) * 255).round().byte()
+        if not cv2.imwrite(str(path), bgr.cpu().numpy()):
+            raise OSError(f"Could not write prior {path}")
+        print(f"{view.image_name}: auxiliary RGB selected on {used.float().mean().item():.1%} of pixels")
+
+
 def render_sets(
     dataset: ModelParams,
     iteration: int,
@@ -330,6 +379,10 @@ def render_sets(
     skip_test: bool,
     threshold: float,
     file_name: str,
+    prior_mode="legacy",
+    depth_tolerance=0.05,
+    source_border_margin=0,
+    legacy_pixel_sampling=True,
 ):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
@@ -337,6 +390,14 @@ def render_sets(
 
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+
+        if prior_mode in ("visible", "consensus"):
+            if not skip_train:
+                render_visible_set(dataset.model_path, "train", scene.loaded_iter,
+                                   scene.getTrainCameras(), threshold, file_name,
+                                   depth_tolerance, background.device, consensus=prior_mode == "consensus",
+                                   border_margin=source_border_margin)
+            return  # Stage two consumes supervision only for fitting views.
 
         if not skip_train:
             render_set(
@@ -349,6 +410,7 @@ def render_sets(
                 background,
                 threshold,
                 file_name,
+                pixel_center_offset=0.0 if legacy_pixel_sampling else 0.5,
             )
 
         if not skip_test:
@@ -362,6 +424,7 @@ def render_sets(
                 background,
                 threshold,
                 file_name,
+                pixel_center_offset=0.0 if legacy_pixel_sampling else 0.5,
             )
 
 
@@ -376,7 +439,28 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--threshold", default=100, type=float)
     parser.add_argument("--file_name", default='', type=str)
+    parser.add_argument("--prior_mode", choices=["legacy", "visible", "consensus"], default="legacy")
+    parser.add_argument("--depth_tolerance", type=float, default=0.05)
+    parser.add_argument("--source_border_margin", type=int, default=0,
+                        help="Exclude this many rim pixels from source views in depth-checked warps.")
+    sampling = parser.add_mutually_exclusive_group()
+    sampling.add_argument("--legacy_pixel_sampling", action="store_true",
+                          help="Use historical pixel sampling (the default for the legacy prior).")
+    sampling.add_argument("--corrected_pixel_sampling", action="store_true",
+                          help="Opt in to corrected pixel-center sampling for the legacy prior; experimental.")
     args = get_combined_args(parser)
+    if (args.legacy_pixel_sampling or args.corrected_pixel_sampling) and args.prior_mode != "legacy":
+        parser.error("pixel sampling options apply only to the legacy prior")
+    if args.source_border_margin < 0 or (args.source_border_margin and args.prior_mode == "legacy"):
+        parser.error("source_border_margin requires a nonnegative margin and a depth-checked prior")
+    if args.prior_mode in ("visible", "consensus"):
+        if args.skip_train or not 0 < args.depth_tolerance < 1:
+            parser.error("visible priors require training views and 0 < depth_tolerance < 1")
+        args.file_name = args.file_name or ("pseudo_GT_" + args.prior_mode)
+        if Path(args.file_name).name != args.file_name or args.file_name in {".", "..", "pseudo_GT", "T", "R", "GT", "Depth_png", "Depth_pth"}:
+            parser.error("choose a separate output directory for visible priors")
+    if args.prior_mode == "legacy":
+        print("Legacy prior pixel sampling: " + ("corrected (opt-in)" if args.corrected_pixel_sampling else "historical (default)"))
     print("Warping " + args.model_path)
 
     # Initialize system state (RNG)
@@ -390,4 +474,8 @@ if __name__ == "__main__":
         args.skip_test,
         args.threshold,
         args.file_name,
+        args.prior_mode,
+        args.depth_tolerance,
+        args.source_border_margin,
+        not args.corrected_pixel_sampling,
     )

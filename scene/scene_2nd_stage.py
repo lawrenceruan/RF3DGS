@@ -11,6 +11,7 @@
 
 import os
 import random
+import torch
 import json
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
@@ -99,6 +100,14 @@ class Scene:
             self.gaussians_Beta_R.create_from_pcd(scene_info.point_cloud, scene_info.train_cameras, self.cameras_extent, load_pcd=False)
 
     def save(self, iteration):
+        # The renderer can produce a finite black PNG from corrupted Gaussians.
+        # Validate each layer before writing any part of the checkpoint.
+        for name, model in (("T", self.gaussians_T), ("R", self.gaussians_R),
+                            ("Beta_R", self.gaussians_Beta_R)):
+            params = (model._xyz, model._features_dc, model._features_rest,
+                      model._opacity, model._scaling, model._rotation)
+            if not torch.stack([torch.isfinite(p).all() for p in params]).all().item():
+                raise FloatingPointError(f"Nonfinite Gaussian parameters in {name} at iteration {iteration}")
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians_T.save_ply(os.path.join(point_cloud_path, "point_cloud_T.ply"))
         self.gaussians_R.save_ply(os.path.join(point_cloud_path, "point_cloud_R.ply"))

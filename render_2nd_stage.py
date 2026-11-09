@@ -26,8 +26,8 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
+import cv2
+import numpy as np
 
 
 def render_set(model_path, name, iteration, views, gaussians_T, gaussians_R, gaussians_Beta_R, pipeline, background, train_test_exp, separate_sh):
@@ -72,10 +72,10 @@ def render_set(model_path, name, iteration, views, gaussians_T, gaussians_R, gau
         depth_T_np = depth_T[0].cpu().numpy()
 
         # Apply a colormap
-        depth_colormap = cm.plasma(depth_T_np)
+        depth_colormap = cv2.applyColorMap((np.nan_to_num(depth_T_np).clip(0, 1) * 255).astype(np.uint8), cv2.COLORMAP_PLASMA)
 
         # Save the colormap image
-        plt.imsave(os.path.join(render_path_Depth_png, img_name + "_depth.png"), depth_colormap)
+        cv2.imwrite(os.path.join(render_path_Depth_png, img_name + "_depth.png"), depth_colormap)
 
         torch.save(
             1 / render_pkg_T["depth"],

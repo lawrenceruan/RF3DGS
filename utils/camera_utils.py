@@ -12,6 +12,7 @@
 from scene.cameras import Camera
 import numpy as np
 from utils.graphics_utils import fov2focal
+from pathlib import Path
 from PIL import Image
 import cv2
 
@@ -19,8 +20,10 @@ WARNED = False
 
 def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dataset):
     image = Image.open(cam_info.image_path)
-    if cam_info.image_path_pseudo_warped is not None:
-        image_pseudo_warped = Image.open(cam_info.image_path_pseudo_warped)
+    folder = getattr(args, "pseudo_warp_folder", "pseudo_GT")
+    if cam_info.image_path_pseudo_warped is not None and (folder == "pseudo_GT" or not is_test_dataset):
+        original = Path(cam_info.image_path_pseudo_warped)
+        image_pseudo_warped = Image.open(original.parent.parent / folder / original.name)
         image_pseudo_learned = Image.open(cam_info.image_path_pseudo_learned)
     else:
         image_pseudo_warped = None
