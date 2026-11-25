@@ -1,3 +1,15 @@
+# RF3DGS: Reflection-Free 3D Gaussian Splatting with Self-Priors
+
+The RF3DGS academic project homepage is included in [`docs/`](docs/). It combines the paper and result figures with installation, data preparation, training, rendering, evaluation, troubleshooting, and project updates.
+
+- [Homepage source and GitHub Pages setup](docs/README.md)
+- [RF3DGS manuscript](docs/assets/rf3dgs-paper.pdf)
+- [Example scene workflow](docs/assets/run_scene.sh)
+
+The documentation distinguishes this public code import from subsequent internal baseline improvements. The original upstream 3D Gaussian Splatting documentation and acknowledgments are retained below.
+
+---
+
 # 3D Gaussian Splatting for Real-Time Radiance Field Rendering
 Bernhard Kerbl*, Georgios Kopanas*, Thomas Leimkühler, George Drettakis (* indicates equal contribution)<br>
 | [Webpage](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) | [Full Paper](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/3d_gaussian_splatting_high.pdf) | [Video](https://youtu.be/T_kXY43VZnk) | [Other GRAPHDECO Publications](http://www-sop.inria.fr/reves/publis/gdindex.php) | [FUNGRAPH project page](https://fungraph.inria.fr) |<br>
